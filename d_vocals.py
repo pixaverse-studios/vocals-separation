@@ -32,6 +32,9 @@ def load_audio(audio_path, device):
         # Load audio with torchaudio
         waveform, sample_rate = torchaudio.load(audio_path)
         
+        # Move waveform to device first
+        waveform = waveform.to(device)
+        
         # Convert to mono if stereo
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
@@ -73,6 +76,14 @@ def save_audio(waveform, sample_rate, output_path):
 class DemucsVocalExtractor:
     def __init__(self, gpu_id=0, segment_size=7.8):
         self.device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
+        
+        # Set memory optimization
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.backends.cudnn.benchmark = True
+            # Set memory optimization
+            torch.cuda.set_per_process_memory_fraction(0.7, gpu_id)  # Use 70% of GPU memory
+        
         self.model = get_model("htdemucs").to(self.device)
         self.segment_size = segment_size
         self.sample_rate = self.model.samplerate
@@ -82,9 +93,7 @@ class DemucsVocalExtractor:
         
         # Optimize for inference
         self.model.eval()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.backends.cudnn.benchmark = True
+        torch.set_grad_enabled(False)
     
     def extract_vocals(self, audio_path, output_path):
         """Extract vocals from audio file"""
