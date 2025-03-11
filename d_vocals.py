@@ -9,10 +9,9 @@ from pathlib import Path
 from tqdm import tqdm
 import argparse
 import glob
-from demucs.pretrained import get_model
-from demucs.apply import apply_model
+import demucs.separate
+import shutil
 import warnings
-import torch.multiprocessing as mp
 
 warnings.filterwarnings("ignore")
 
@@ -20,182 +19,81 @@ warnings.filterwarnings("ignore")
 OUTPUT_SAMPLE_RATE = 16000  # 16kHz output
 OUTPUT_CHANNELS = 1  # mono output
 MP3_BITRATE = 96  # kbps, good balance for voice
-SEGMENT_LENGTH = 7  # seconds, optimal for htdemucs
 BASE_DIR = "."
 OUTPUT_DIR = os.path.join(BASE_DIR, "vocal_output")
 
 # Create output directory
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-class VocalExtractor:
-    def __init__(self, model_name='htdemucs', device_ids=None, segment_length=SEGMENT_LENGTH):
-        """Initialize the vocal extractor with specified model and devices."""
-        self.model_name = model_name
-        self.segment_length = segment_length
-        self.device_ids = device_ids if device_ids else list(range(torch.cuda.device_count()))
-        self.num_gpus = len(self.device_ids) if self.device_ids else 0
+def process_file(args):
+    """Process a single file using Demucs."""
+    audio_file, output_base_dir, input_base_dir, gpu_id = args
+    
+    try:
+        # Calculate relative path to maintain folder structure
+        rel_path = os.path.relpath(audio_file, input_base_dir)
         
-        # Load model on CPU first
-        self.model = get_model(model_name)
-        self.model.eval()
+        # Create output path with same folder structure
+        output_name = f"{os.path.splitext(os.path.basename(audio_file))[0]}_vocals.mp3"
+        output_path = os.path.join(output_base_dir, os.path.dirname(rel_path), output_name)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
-        # Initialize GPU queue if available
-        if self.num_gpus > 0:
-            self.gpu_queue = mp.Queue()
-            for device_id in self.device_ids:
-                self.gpu_queue.put(device_id)
-    
-    def get_device(self):
-        """Get next available GPU or CPU."""
-        if self.num_gpus > 0:
-            device_id = self.gpu_queue.get()
-            device = torch.device(f'cuda:{device_id}')
-            return device, device_id
-        return torch.device('cpu'), None
-    
-    def release_device(self, device_id):
-        """Release GPU back to queue."""
-        if device_id is not None:
-            self.gpu_queue.put(device_id)
-    
-    def load_audio(self, audio_path):
-        """Load audio file and resample if necessary."""
-        try:
-            waveform, sample_rate = torchaudio.load(audio_path)
+        # Set CUDA device for this process
+        if gpu_id is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        
+        # Create temporary directory for Demucs output
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Run Demucs
+            demucs.separate.main([
+                "-n", "htdemucs",  # use htdemucs model
+                "--two-stems=vocals",  # only extract vocals
+                "--mp3",  # output as mp3
+                "--mp3-bitrate", str(MP3_BITRATE),
+                "--segment", "7",  # optimal segment length for htdemucs
+                "-j", "1",  # single thread per process since we're using multiprocessing
+                "-o", temp_dir,  # output to temp directory
+                audio_file
+            ])
             
-            # Convert to mono if stereo
-            if waveform.shape[0] > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            # Find the vocals file in the output
+            model_dir = "htdemucs"
+            track_name = os.path.splitext(os.path.basename(audio_file))[0]
+            vocals_file = os.path.join(temp_dir, model_dir, track_name, "vocals.mp3")
             
-            # Resample if necessary
-            if sample_rate != self.model.samplerate:
-                waveform = torchaudio.transforms.Resample(
-                    sample_rate, self.model.samplerate
-                )(waveform)
-            
-            return waveform, self.model.samplerate
-        except Exception as e:
-            print(f"Error loading {audio_path}: {str(e)}")
-            return None, None
-
-    def save_audio(self, waveform, output_path, original_sr):
-        """Save audio as MP3 with specified sample rate and channels."""
-        try:
-            # Resample to target sample rate
-            if original_sr != OUTPUT_SAMPLE_RATE:
-                waveform = torchaudio.transforms.Resample(
-                    original_sr, OUTPUT_SAMPLE_RATE
-                )(waveform)
-            
-            # Ensure output directory exists
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
-            # Save as MP3
-            torchaudio.save(
-                output_path,
-                waveform,
-                OUTPUT_SAMPLE_RATE,
-                format='mp3',
-                encoding_args={'bit_rate': MP3_BITRATE * 1000}
-            )
-            return True
-        except Exception as e:
-            print(f"Error saving {output_path}: {str(e)}")
-            return False
-
-    def process_segment(self, waveform, device, offset=0, total_length=None):
-        """Process a single segment of audio."""
-        try:
-            # Move model to device if needed
-            if next(self.model.parameters()).device != device:
-                self.model.to(device)
-            
-            # Apply model and extract vocals
-            with torch.no_grad():
-                # Get model output
-                output = self.model.separate(waveform.to(device))
+            if os.path.exists(vocals_file):
+                # Convert to 16kHz mono
+                waveform, sr = torchaudio.load(vocals_file)
+                if waveform.shape[0] > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+                if sr != OUTPUT_SAMPLE_RATE:
+                    waveform = torchaudio.transforms.Resample(sr, OUTPUT_SAMPLE_RATE)(waveform)
                 
-                # Extract vocals (last source in the output)
-                vocals = output[-1]
-                
-                # Move back to CPU to free GPU memory
-                vocals = vocals.cpu()
-                
-            return vocals
-            
-        except Exception as e:
-            print(f"Error processing segment: {str(e)}")
-            return None
-
-    def process_audio(self, audio_path, output_path=None):
-        """Process a single audio file."""
-        try:
-            # Setup output path
-            if output_path is None:
-                filename = os.path.basename(audio_path)
-                output_path = os.path.join(
-                    OUTPUT_DIR,
-                    f"{os.path.splitext(filename)[0]}_vocals.mp3"
+                # Save final output
+                torchaudio.save(
+                    output_path,
+                    waveform,
+                    OUTPUT_SAMPLE_RATE,
+                    format='mp3',
+                    encoding_args={'bit_rate': MP3_BITRATE * 1000}
                 )
+                return output_path
             
-            # Load audio
-            waveform, sr = self.load_audio(audio_path)
-            if waveform is None:
-                return None
-            
-            # Get device
-            device, device_id = self.get_device()
-            
-            try:
-                # Process audio
-                vocals = self.process_segment(waveform, device)
-                if vocals is None:
-                    return None
+        return None
                 
-                # Save result
-                success = self.save_audio(vocals, output_path, sr)
-                
-                # Clean up
-                del vocals
-                torch.cuda.empty_cache()
-                
-                return output_path if success else None
-                
-            finally:
-                # Always release device
-                self.release_device(device_id)
-                
-        except Exception as e:
-            print(f"Error processing {audio_path}: {str(e)}")
-            return None
+    except Exception as e:
+        print(f"Error processing {audio_file}: {str(e)}")
+        return None
 
 def process_batch(args):
     """Process a batch of files using multiple GPUs."""
-    file_list, output_base_dir, input_base_dir, gpu_ids = args
-    
-    # Initialize extractor for this process
-    extractor = VocalExtractor(device_ids=gpu_ids)
+    file_list, output_base_dir, input_base_dir, gpu_id = args
     
     results = []
     for audio_file in tqdm(file_list, desc="Processing files", leave=False):
-        try:
-            # Calculate relative path to maintain folder structure
-            rel_path = os.path.relpath(audio_file, input_base_dir)
-            
-            # Create output path with same folder structure
-            output_path = os.path.join(
-                output_base_dir,
-                os.path.dirname(rel_path),
-                f"{os.path.splitext(os.path.basename(audio_file))[0]}_vocals.mp3"
-            )
-            
-            result = extractor.process_audio(audio_file, output_path)
-            if result:
-                results.append(result)
-                
-        except Exception as e:
-            print(f"Error processing {audio_file}: {str(e)}")
-            continue
+        result = process_file((audio_file, output_base_dir, input_base_dir, gpu_id))
+        if result:
+            results.append(result)
     
     return results
 
@@ -272,8 +170,8 @@ def main():
     for i in range(0, len(input_files), files_per_worker):
         batch_files = input_files[i:i + files_per_worker]
         # Assign GPUs round-robin to batches
-        batch_gpu_ids = [i % num_gpus] if num_gpus > 0 else None
-        batches.append((batch_files, output_base_dir, input_base_dirs[0], batch_gpu_ids))
+        batch_gpu_id = i % num_gpus if num_gpus > 0 else None
+        batches.append((batch_files, output_base_dir, input_base_dirs[0], batch_gpu_id))
     
     # Process all batches in parallel
     processed_files = []
@@ -291,6 +189,5 @@ def main():
     print(f"\nSuccessfully processed {len(processed_files)} files")
 
 if __name__ == "__main__":
-    # For better multiprocessing on Unix
-    mp.set_start_method('spawn', force=True)
+    import tempfile
     main() 
