@@ -6,6 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 import demucs.api
 import logging
+import time
 
 # Set up logging
 logging.basicConfig(
@@ -29,6 +30,7 @@ class VocalSeparator:
         self.bitrate = bitrate
         
         logging.info("Loading model weights...")
+        start_time = time.time()
         # Initialize separator on GPU 0 and pre-load weights
         self.separator = demucs.api.Separator(
             model=model_name,
@@ -39,7 +41,7 @@ class VocalSeparator:
         # Force model weight loading by doing a tiny separation
         dummy_audio = torch.zeros(2, 44100, device="cuda:0")  # 1 second of silence
         self.separator.separate_tensor(dummy_audio)
-        logging.info("Model weights loaded successfully")
+        logging.info(f"Model weights loaded successfully in {time.time() - start_time:.2f} seconds")
     
     def process_file(self, input_file, base_input_dir=None):
         """Process a single file while preserving directory structure"""
@@ -61,10 +63,18 @@ class VocalSeparator:
             # Skip if output already exists
             if output_path.exists():
                 return None
+
+            # Time the entire process
+            total_start = time.time()
             
+            # Time loading audio
+            load_start = time.time()
             # Separate vocals
             _, separated = self.separator.separate_audio_file(str(input_file))
+            load_time = time.time() - load_start
             
+            # Time post-processing (mono conversion and resampling)
+            post_start = time.time()
             # Extract vocals and convert to mono 16kHz
             vocals = separated['vocals']
             if vocals.shape[0] > 1:  # If stereo, convert to mono
@@ -77,7 +87,10 @@ class VocalSeparator:
                     OUTPUT_SAMPLE_RATE
                 ).to(vocals.device)
                 vocals = resampler(vocals)
+            post_time = time.time() - post_start
             
+            # Time saving
+            save_start = time.time()
             # Save as MP3
             demucs.api.save_audio(
                 vocals,
@@ -85,10 +98,24 @@ class VocalSeparator:
                 samplerate=OUTPUT_SAMPLE_RATE,
                 bitrate=self.bitrate
             )
+            save_time = time.time() - save_start
             
+            # Time cleanup
+            cleanup_start = time.time()
             # Clear memory
             del vocals, separated
             torch.cuda.empty_cache()
+            cleanup_time = time.time() - cleanup_start
+            
+            total_time = time.time() - total_start
+            
+            # Log timing information
+            logging.info(f"\nProcessing times for {input_path.name}:")
+            logging.info(f"  Loading and separation: {load_time:.2f}s")
+            logging.info(f"  Post-processing: {post_time:.2f}s")
+            logging.info(f"  Saving: {save_time:.2f}s")
+            logging.info(f"  Cleanup: {cleanup_time:.2f}s")
+            logging.info(f"  Total time: {total_time:.2f}s")
             
             return str(output_path)
             
