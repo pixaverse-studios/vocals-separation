@@ -36,12 +36,22 @@ class VocalSeparator:
             progress=False
         )
     
-    def process_file(self, input_file):
-        """Process a single file"""
+    def process_file(self, input_file, base_input_dir=None):
+        """Process a single file while preserving directory structure"""
         try:
-            # Generate output path
-            rel_path = Path(input_file).stem
-            output_path = self.output_dir / f"{rel_path}_vocals.mp3"
+            # Generate output path preserving directory structure
+            input_path = Path(input_file)
+            if base_input_dir:
+                # Get the relative path from base_input_dir
+                rel_path = input_path.relative_to(base_input_dir)
+                # Create output path with preserved structure
+                output_path = self.output_dir / rel_path.parent / f"{rel_path.stem}_vocals.mp3"
+            else:
+                # If no base_input_dir, just use the filename
+                output_path = self.output_dir / f"{input_path.stem}_vocals.mp3"
+            
+            # Create parent directories if they don't exist
+            output_path.parent.mkdir(parents=True, exist_ok=True)
             
             # Skip if output already exists
             if output_path.exists():
@@ -81,7 +91,7 @@ class VocalSeparator:
             logging.error(f"Error processing {input_file}: {str(e)}")
             return None
 
-    def process_files(self, input_files):
+    def process_files(self, input_files, base_input_dir=None):
         """Process all files sequentially"""
         processed_files = []
         failed_files = []
@@ -89,7 +99,7 @@ class VocalSeparator:
         with tqdm(total=len(input_files), desc="Processing files") as pbar:
             for input_file in input_files:
                 try:
-                    result = self.process_file(input_file)
+                    result = self.process_file(input_file, base_input_dir)
                     if result:
                         processed_files.append(result)
                     else:
@@ -123,11 +133,14 @@ def main():
     
     args = parser.parse_args()
     
-    # Collect all input files
+    # Collect all input files and their base directories
     input_files = []
+    base_input_dir = None
+    
     for input_path in args.inputs:
         path = Path(input_path)
         if path.is_dir():
+            base_input_dir = path  # Use the input directory as base
             for ext in ['mp3', 'wav', 'flac', 'ogg', 'm4a']:
                 input_files.extend(path.rglob(f"*.{ext}"))
         else:
@@ -150,7 +163,7 @@ def main():
         bitrate=args.bitrate
     )
     
-    processed_files, failed_files = separator.process_files(input_files)
+    processed_files, failed_files = separator.process_files(input_files, base_input_dir)
     
     logging.info(f"\nProcessing complete:")
     logging.info(f"Successfully processed: {len(processed_files)} files")
