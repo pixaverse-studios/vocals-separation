@@ -16,9 +16,10 @@ NUM_GPUS = 3  # Number of available GPUs
 MAX_WORKERS = 128  # Maximum number of CPU threads
 
 class VocalSeparator:
-    def __init__(self, output_dir="vocal_output", model_name="htdemucs", segment=DEFAULT_SEGMENT):
+    def __init__(self, output_dir="vocal_output", model_name="htdemucs", segment=DEFAULT_SEGMENT, bitrate=128):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.bitrate = bitrate  # Added bitrate parameter
         
         # Initialize separators for each GPU
         self.separators = []
@@ -77,7 +78,7 @@ class VocalSeparator:
                 vocals,
                 str(output_path),
                 samplerate=OUTPUT_SAMPLE_RATE,
-                bitrate=96  # Good quality for voice at 16kHz
+                bitrate=self.bitrate  # Now using configurable bitrate
             )
             
             # Clear GPU memory
@@ -127,6 +128,8 @@ def main():
                        help="Segment length in seconds (max 7.8)")
     parser.add_argument("--model", default="htdemucs", 
                        help="Model to use (htdemucs, htdemucs_ft)")
+    parser.add_argument("--bitrate", type=int, default=128,
+                       help="MP3 output bitrate in kbps (default: 128)")
     
     args = parser.parse_args()
     
@@ -153,7 +156,8 @@ def main():
     separator = VocalSeparator(
         output_dir=args.output,
         model_name=args.model,
-        segment=args.segment
+        segment=args.segment,
+        bitrate=args.bitrate  # Added bitrate parameter
     )
     
     processed_files = separator.process_files(input_files)
