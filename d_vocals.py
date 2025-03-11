@@ -112,17 +112,11 @@ class VocalExtractor:
             
             # Apply model and extract vocals
             with torch.no_grad():
-                sources = apply_model(
-                    self.model,
-                    waveform.to(device),
-                    device=device,
-                    split=True,
-                    overlap=0.1,
-                    progress=False
-                )
+                # Get model output
+                output = self.model.separate(waveform.to(device))
                 
-                # Extract vocals (usually the last source)
-                vocals = sources[-1]
+                # Extract vocals (last source in the output)
+                vocals = output[-1]
                 
                 # Move back to CPU to free GPU memory
                 vocals = vocals.cpu()
