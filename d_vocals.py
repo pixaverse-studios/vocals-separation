@@ -6,6 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 import demucs.api
 import logging
+import concurrent.futures
 
 # Set up logging
 logging.basicConfig(
@@ -21,6 +22,7 @@ logging.basicConfig(
 OUTPUT_SAMPLE_RATE = 16000  # 16kHz output
 OUTPUT_CHANNELS = 1  # mono output
 DEFAULT_SEGMENT = 7  # Demucs v4 supports up to 7.8s segments
+NUM_GPUS = 3  # Number of GPUs to use
 
 class VocalSeparator:
     def __init__(self, output_dir="vocal_output", model_name="htdemucs", segment=DEFAULT_SEGMENT, bitrate=128):
@@ -28,16 +30,22 @@ class VocalSeparator:
         self.output_dir.mkdir(exist_ok=True)
         self.bitrate = bitrate
         
-        # Initialize separator on GPU 0
-        self.separator = demucs.api.Separator(
-            model=model_name,
-            segment=segment,
-            device="cuda:0",
-            progress=False
-        )
+        # Initialize separators for all GPUs
+        logging.info("Pre-loading model weights for all GPUs...")
+        self.separators = []
+        for gpu_id in range(NUM_GPUS):
+            device = f"cuda:{gpu_id}"
+            separator = demucs.api.Separator(
+                model=model_name,
+                segment=segment,
+                device=device,
+                progress=False
+            )
+            self.separators.append(separator)
+        logging.info("Model weights loaded successfully")
     
-    def process_file(self, input_file, base_input_dir=None):
-        """Process a single file while preserving directory structure"""
+    def process_file_on_gpu(self, input_file, gpu_id, base_input_dir=None):
+        """Process a single file on a specific GPU"""
         try:
             # Generate output path preserving directory structure
             input_path = Path(input_file)
@@ -57,8 +65,11 @@ class VocalSeparator:
             if output_path.exists():
                 return None
             
+            # Get the separator for this GPU
+            separator = self.separators[gpu_id]
+            
             # Separate vocals
-            _, separated = self.separator.separate_audio_file(str(input_file))
+            _, separated = separator.separate_audio_file(str(input_file))
             
             # Extract vocals and convert to mono 16kHz
             vocals = separated['vocals']
@@ -66,9 +77,9 @@ class VocalSeparator:
                 vocals = vocals.mean(dim=0, keepdim=True)
             
             # Resample if needed
-            if self.separator.samplerate != OUTPUT_SAMPLE_RATE:
+            if separator.samplerate != OUTPUT_SAMPLE_RATE:
                 resampler = torchaudio.transforms.Resample(
-                    self.separator.samplerate, 
+                    separator.samplerate, 
                     OUTPUT_SAMPLE_RATE
                 ).to(vocals.device)
                 vocals = resampler(vocals)
@@ -88,29 +99,38 @@ class VocalSeparator:
             return str(output_path)
             
         except Exception as e:
-            logging.error(f"Error processing {input_file}: {str(e)}")
+            logging.error(f"Error processing {input_file} on GPU {gpu_id}: {str(e)}")
             return None
 
     def process_files(self, input_files, base_input_dir=None):
-        """Process all files sequentially"""
+        """Process files in parallel using all GPUs"""
         processed_files = []
         failed_files = []
         
-        with tqdm(total=len(input_files), desc="Processing files") as pbar:
-            for input_file in input_files:
-                try:
-                    result = self.process_file(input_file, base_input_dir)
-                    if result:
-                        processed_files.append(result)
-                    else:
+        # Create a thread pool with NUM_GPUS workers
+        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_GPUS) as executor:
+            # Create futures for each file, distributing them across GPUs
+            futures = []
+            for i, input_file in enumerate(input_files):
+                gpu_id = i % NUM_GPUS
+                future = executor.submit(self.process_file_on_gpu, input_file, gpu_id, base_input_dir)
+                futures.append((future, input_file))
+            
+            # Process results as they complete
+            with tqdm(total=len(input_files), desc="Processing files") as pbar:
+                for future, input_file in futures:
+                    try:
+                        result = future.result()
+                        if result:
+                            processed_files.append(result)
+                        else:
+                            failed_files.append(str(input_file))
+                    except Exception as e:
+                        logging.error(f"Error processing {input_file}: {str(e)}")
                         failed_files.append(str(input_file))
-                except Exception as e:
-                    logging.error(f"Error processing {input_file}: {str(e)}")
-                    failed_files.append(str(input_file))
-                finally:
-                    pbar.update(1)
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    finally:
+                        pbar.update(1)
+                        gc.collect()
         
         if failed_files:
             with open(self.output_dir / "failed_files.txt", 'w') as f:
