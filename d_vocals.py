@@ -10,6 +10,9 @@ import time
 import multiprocessing as mp
 from itertools import islice
 
+# Set multiprocessing start method to 'spawn'
+mp.set_start_method('spawn', force=True)
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
