@@ -41,11 +41,13 @@ def process_file(args):
         # Set CUDA device for this process
         if gpu_id is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Use CPU if no GPU specified
         
         # Create temporary directory for Demucs output
         with tempfile.TemporaryDirectory() as temp_dir:
             # Run Demucs
-            demucs.separate.main([
+            args = [
                 "-n", "htdemucs",  # use htdemucs model
                 "--two-stems=vocals",  # only extract vocals
                 "--mp3",  # output as mp3
@@ -53,8 +55,19 @@ def process_file(args):
                 "--segment", "7",  # optimal segment length for htdemucs
                 "-j", "1",  # single thread per process since we're using multiprocessing
                 "-o", temp_dir,  # output to temp directory
-                audio_file
-            ])
+            ]
+            
+            # Add device selection
+            if gpu_id is not None:
+                args.extend(["-d", "cuda"])
+            else:
+                args.extend(["-d", "cpu"])
+                
+            # Add input file
+            args.append(audio_file)
+            
+            # Run Demucs
+            demucs.separate.main(args)
             
             # Find the vocals file in the output
             model_dir = "htdemucs"
@@ -169,7 +182,7 @@ def main():
     
     for i in range(0, len(input_files), files_per_worker):
         batch_files = input_files[i:i + files_per_worker]
-        # Assign GPUs round-robin to batches
+        # Assign GPUs round-robin to batches, starting from 0
         batch_gpu_id = i % num_gpus if num_gpus > 0 else None
         batches.append((batch_files, output_base_dir, input_base_dirs[0], batch_gpu_id))
     
