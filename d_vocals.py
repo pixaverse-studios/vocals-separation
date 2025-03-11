@@ -13,13 +13,14 @@ OUTPUT_SAMPLE_RATE = 16000  # 16kHz output
 OUTPUT_CHANNELS = 1  # mono output
 DEFAULT_SEGMENT = 7  # Demucs v4 supports up to 7.8s segments
 NUM_GPUS = 3  # Number of available GPUs
-MAX_WORKERS = 128  # Maximum number of CPU threads
+MAX_WORKERS = 32  # Reduced number of workers
+BATCH_SIZE = 1000  # Process files in batches
 
 class VocalSeparator:
     def __init__(self, output_dir="vocal_output", model_name="htdemucs", segment=DEFAULT_SEGMENT, bitrate=128):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
-        self.bitrate = bitrate  # Added bitrate parameter
+        self.bitrate = bitrate
         
         # Initialize separators for each GPU
         self.separators = []
@@ -29,11 +30,10 @@ class VocalSeparator:
                 model=model_name,
                 segment=segment,
                 device=device,
-                progress=False  # We'll handle our own progress bar
+                progress=False
             )
             self.separators.append(separator)
         
-        # Keep track of GPU usage
         self.current_gpu = 0
         
     def _get_next_gpu(self):
@@ -73,15 +73,15 @@ class VocalSeparator:
                 ).to(vocals.device)
                 vocals = resampler(vocals)
             
-            # Save as MP3 with appropriate bitrate for voice
+            # Save as MP3
             demucs.api.save_audio(
                 vocals,
                 str(output_path),
                 samplerate=OUTPUT_SAMPLE_RATE,
-                bitrate=self.bitrate  # Now using configurable bitrate
+                bitrate=self.bitrate
             )
             
-            # Clear GPU memory
+            # Clear memory
             del vocals, separated
             torch.cuda.empty_cache()
             
@@ -91,18 +91,14 @@ class VocalSeparator:
             print(f"Error processing {input_file}: {str(e)}")
             return None
 
-    def process_files(self, input_files):
-        """Process multiple files in parallel using ProcessPoolExecutor"""
+    def process_batch(self, batch_files):
+        """Process a batch of files"""
         results = []
         
-        # Create progress bar
-        pbar = tqdm(total=len(input_files), desc="Processing files")
-        
-        # Process files in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_file = {
                 executor.submit(self._process_file, input_file): input_file 
-                for input_file in input_files
+                for input_file in batch_files
             }
             
             for future in concurrent.futures.as_completed(future_to_file):
@@ -113,11 +109,26 @@ class VocalSeparator:
                         results.append(result)
                 except Exception as e:
                     print(f"Error processing {input_file}: {str(e)}")
-                finally:
-                    pbar.update(1)
-        
-        pbar.close()
+                
         return results
+
+    def process_files(self, input_files):
+        """Process all files in batches"""
+        all_results = []
+        total_batches = (len(input_files) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        with tqdm(total=len(input_files), desc="Processing files") as pbar:
+            for i in range(0, len(input_files), BATCH_SIZE):
+                batch = input_files[i:i + BATCH_SIZE]
+                results = self.process_batch(batch)
+                all_results.extend(results)
+                pbar.update(len(batch))
+                
+                # Force garbage collection between batches
+                gc.collect()
+                torch.cuda.empty_cache()
+        
+        return all_results
 
 def main():
     import argparse
@@ -130,8 +141,17 @@ def main():
                        help="Model to use (htdemucs, htdemucs_ft)")
     parser.add_argument("--bitrate", type=int, default=128,
                        help="MP3 output bitrate in kbps (default: 128)")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                       help=f"Number of files to process in each batch (default: {BATCH_SIZE})")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
+                       help=f"Number of parallel workers (default: {MAX_WORKERS})")
     
     args = parser.parse_args()
+    
+    # Update constants based on args
+    global BATCH_SIZE, MAX_WORKERS
+    BATCH_SIZE = args.batch_size
+    MAX_WORKERS = args.workers
     
     # Collect all input files
     input_files = []
@@ -151,13 +171,14 @@ def main():
         return
     
     print(f"Found {len(input_files)} files to process")
+    print(f"Processing in batches of {BATCH_SIZE} files with {MAX_WORKERS} workers")
     
     # Initialize separator and process files
     separator = VocalSeparator(
         output_dir=args.output,
         model_name=args.model,
         segment=args.segment,
-        bitrate=args.bitrate  # Added bitrate parameter
+        bitrate=args.bitrate
     )
     
     processed_files = separator.process_files(input_files)
