@@ -131,6 +131,8 @@ class VocalSeparator:
         return all_results
 
 def main():
+    global BATCH_SIZE, MAX_WORKERS
+    
     import argparse
     parser = argparse.ArgumentParser(description="Extract vocals using Demucs v4")
     parser.add_argument("inputs", nargs="+", help="Input audio files or directories")
@@ -149,7 +151,6 @@ def main():
     args = parser.parse_args()
     
     # Update constants based on args
-    global BATCH_SIZE, MAX_WORKERS
     BATCH_SIZE = args.batch_size
     MAX_WORKERS = args.workers
     
