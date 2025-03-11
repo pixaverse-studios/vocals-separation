@@ -9,18 +9,18 @@ import logging
 import time
 import multiprocessing as mp
 from itertools import islice
-import threading
-from queue import Queue
+from datetime import datetime, timedelta
 
 # Set multiprocessing start method to 'spawn'
 mp.set_start_method('spawn', force=True)
 
-# Set up logging - only log errors to file
+# Set up logging
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('vocals_separation.log'),
+        logging.StreamHandler()
     ]
 )
 
@@ -30,31 +30,6 @@ OUTPUT_CHANNELS = 1  # mono output
 DEFAULT_SEGMENT = 7  # Demucs v4 supports up to 7.8s segments
 NUM_GPUS = 3  # Number of GPUs to use
 
-# Shared progress tracking
-progress_queue = Queue()
-total_processed = mp.Value('i', 0)
-start_time = None
-
-def progress_monitor(total_files):
-    """Monitor progress across all GPUs"""
-    pbar = tqdm(total=total_files, desc="Processing files", unit="file")
-    while True:
-        val = progress_queue.get()
-        if val == "DONE":
-            break
-        with total_processed.get_lock():
-            total_processed.value += 1
-            pbar.update(1)
-            # Calculate ETA
-            if total_processed.value > 0 and start_time is not None:
-                elapsed = time.time() - start_time
-                rate = total_processed.value / elapsed
-                eta = (total_files - total_processed.value) / rate
-                hours = int(eta // 3600)
-                minutes = int((eta % 3600) // 60)
-                pbar.set_postfix({'ETA': f'{hours}h {minutes}m', 'Speed': f'{rate:.2f} files/s'})
-    pbar.close()
-
 class VocalSeparator:
     def __init__(self, output_dir="vocal_output", model_name="htdemucs", segment=DEFAULT_SEGMENT, bitrate=128, gpu_id=0):
         self.output_dir = Path(output_dir)
@@ -62,6 +37,7 @@ class VocalSeparator:
         self.bitrate = bitrate
         self.gpu_id = gpu_id
         
+        logging.info(f"[GPU {gpu_id}] Loading model weights...")
         # Initialize separator on specified GPU
         self.separator = demucs.api.Separator(
             model=model_name,
@@ -70,21 +46,28 @@ class VocalSeparator:
             progress=False
         )
         # Force model weight loading by doing a tiny separation
-        dummy_audio = torch.zeros(2, 44100, device=f"cuda:{gpu_id}")
+        dummy_audio = torch.zeros(2, 44100, device=f"cuda:{gpu_id}")  # 1 second of silence
         self.separator.separate_tensor(dummy_audio)
+        logging.info(f"[GPU {gpu_id}] Model ready")
     
     def process_file(self, input_file, base_input_dir=None):
+        """Process a single file while preserving directory structure"""
         try:
             # Generate output path preserving directory structure
             input_path = Path(input_file)
             if base_input_dir:
+                # Get the relative path from base_input_dir
                 rel_path = input_path.relative_to(base_input_dir)
+                # Create output path with preserved structure
                 output_path = self.output_dir / rel_path.parent / f"{rel_path.stem}_vocals.mp3"
             else:
+                # If no base_input_dir, just use the filename
                 output_path = self.output_dir / f"{input_path.stem}_vocals.mp3"
             
+            # Create parent directories if they don't exist
             output_path.parent.mkdir(parents=True, exist_ok=True)
             
+            # Skip if output already exists
             if output_path.exists():
                 return None
 
@@ -93,7 +76,7 @@ class VocalSeparator:
             
             # Extract vocals and convert to mono 16kHz
             vocals = separated['vocals']
-            if vocals.shape[0] > 1:
+            if vocals.shape[0] > 1:  # If stereo, convert to mono
                 vocals = vocals.mean(dim=0, keepdim=True)
             
             # Resample if needed
@@ -119,25 +102,37 @@ class VocalSeparator:
             return str(output_path)
             
         except Exception as e:
-            logging.error(f"Error processing {input_file}: {str(e)}")
+            logging.error(f"[GPU {self.gpu_id}] Error processing {input_file}: {str(e)}")
             return None
 
     def process_files(self, input_files, base_input_dir=None):
+        """Process all files sequentially"""
         processed_files = []
         failed_files = []
         
-        for input_file in input_files:
-            try:
-                result = self.process_file(input_file, base_input_dir)
-                if result:
-                    processed_files.append(result)
-                else:
+        total_files = len(input_files)
+        files_per_gpu = total_files // NUM_GPUS
+        estimated_time_per_file = 1.0  # seconds
+        total_estimated_time = timedelta(seconds=files_per_gpu * estimated_time_per_file)
+        estimated_completion = datetime.now() + total_estimated_time
+        
+        logging.info(f"[GPU {self.gpu_id}] Processing {len(input_files)} files. Estimated completion: {estimated_completion.strftime('%H:%M:%S')}")
+        
+        with tqdm(total=len(input_files), desc=f"[GPU {self.gpu_id}]") as pbar:
+            for input_file in input_files:
+                try:
+                    result = self.process_file(input_file, base_input_dir)
+                    if result:
+                        processed_files.append(result)
+                    else:
+                        failed_files.append(str(input_file))
+                except Exception as e:
+                    logging.error(f"[GPU {self.gpu_id}] Error processing {input_file}: {str(e)}")
                     failed_files.append(str(input_file))
-            except Exception as e:
-                logging.error(f"Error processing {input_file}: {str(e)}")
-                failed_files.append(str(input_file))
-            finally:
-                progress_queue.put(1)
+                finally:
+                    pbar.update(1)
+                    gc.collect()
+                    torch.cuda.empty_cache()
         
         if failed_files:
             failed_file_path = self.output_dir / f"failed_files_gpu{self.gpu_id}.txt"
@@ -148,6 +143,7 @@ class VocalSeparator:
         return processed_files, failed_files
 
 def process_gpu_batch(gpu_id, files, output_dir, model_name, segment, bitrate, base_input_dir):
+    """Function to run in each process"""
     separator = VocalSeparator(
         output_dir=output_dir,
         model_name=model_name,
@@ -158,11 +154,11 @@ def process_gpu_batch(gpu_id, files, output_dir, model_name, segment, bitrate, b
     return separator.process_files(files, base_input_dir)
 
 def split_list(lst, n):
+    """Split a list into n roughly equal parts"""
     k, m = divmod(len(lst), n)
     return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
 
 def main():
-    global start_time
     import argparse
     parser = argparse.ArgumentParser(description="Extract vocals using Demucs v4")
     parser.add_argument("inputs", nargs="+", help="Input audio files or directories")
@@ -176,38 +172,30 @@ def main():
     
     args = parser.parse_args()
     
-    # Collect all input files
+    # Collect all input files and their base directories
     input_files = []
     base_input_dir = None
     
     for input_path in args.inputs:
         path = Path(input_path)
         if path.is_dir():
-            base_input_dir = path
+            base_input_dir = path  # Use the input directory as base
             for ext in ['mp3', 'wav', 'flac', 'ogg', 'm4a']:
                 input_files.extend(path.rglob(f"*.{ext}"))
         else:
             input_files.append(path)
     
+    # Remove duplicates while preserving order
     input_files = list(dict.fromkeys(input_files))
     
     if not input_files:
-        print("No input files found.")
+        logging.error("No input files found.")
         return
     
-    total_files = len(input_files)
-    print(f"Found {total_files} files to process")
+    logging.info(f"Found {len(input_files)} files to process")
     
-    # Start progress monitoring thread
-    monitor_thread = threading.Thread(target=progress_monitor, args=(total_files,))
-    monitor_thread.daemon = True
-    monitor_thread.start()
-    
-    # Split files into GPU groups
+    # Split files into NUM_GPUS groups
     file_groups = split_list(input_files, NUM_GPUS)
-    
-    # Start timing
-    start_time = time.time()
     
     # Create processes for each GPU
     processes = []
@@ -231,21 +219,9 @@ def main():
     for p in processes:
         p.join()
     
-    # Signal progress monitor to finish
-    progress_queue.put("DONE")
-    monitor_thread.join()
+    logging.info("\nAll processes completed")
     
-    # Print final statistics
-    total_time = time.time() - start_time
-    hours = int(total_time // 3600)
-    minutes = int((total_time % 3600) // 60)
-    seconds = int(total_time % 60)
-    files_per_second = total_files / total_time
-    
-    print(f"\nProcessing complete in {hours}h {minutes}m {seconds}s")
-    print(f"Average processing speed: {files_per_second:.2f} files/second")
-    
-    # Combine failed files
+    # Combine failed files from all GPUs
     all_failed_files = []
     for gpu_id in range(NUM_GPUS):
         failed_file_path = Path(args.output) / f"failed_files_gpu{gpu_id}.txt"
@@ -256,9 +232,10 @@ def main():
     if all_failed_files:
         with open(Path(args.output) / "failed_files.txt", 'w') as f:
             f.writelines(all_failed_files)
-        print(f"Failed to process {len(all_failed_files)} files")
-        print("Failed files have been saved to failed_files.txt")
+        logging.warning(f"Failed to process {len(all_failed_files)} files")
+        logging.info("Failed files have been saved to failed_files.txt")
 
 if __name__ == "__main__":
+    # Required for Windows support
     mp.freeze_support()
     main() 
