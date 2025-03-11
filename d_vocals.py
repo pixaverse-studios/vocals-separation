@@ -7,6 +7,8 @@ from tqdm import tqdm
 import demucs.api
 import logging
 import time
+import multiprocessing as mp
+from itertools import islice
 
 # Set up logging
 logging.basicConfig(
@@ -22,26 +24,28 @@ logging.basicConfig(
 OUTPUT_SAMPLE_RATE = 16000  # 16kHz output
 OUTPUT_CHANNELS = 1  # mono output
 DEFAULT_SEGMENT = 7  # Demucs v4 supports up to 7.8s segments
+NUM_GPUS = 3  # Number of GPUs to use
 
 class VocalSeparator:
-    def __init__(self, output_dir="vocal_output", model_name="htdemucs", segment=DEFAULT_SEGMENT, bitrate=128):
+    def __init__(self, output_dir="vocal_output", model_name="htdemucs", segment=DEFAULT_SEGMENT, bitrate=128, gpu_id=0):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.bitrate = bitrate
+        self.gpu_id = gpu_id
         
-        logging.info("Loading model weights...")
+        logging.info(f"[GPU {gpu_id}] Loading model weights...")
         start_time = time.time()
-        # Initialize separator on GPU 0 and pre-load weights
+        # Initialize separator on specified GPU
         self.separator = demucs.api.Separator(
             model=model_name,
             segment=segment,
-            device="cuda:0",
+            device=f"cuda:{gpu_id}",
             progress=False
         )
         # Force model weight loading by doing a tiny separation
-        dummy_audio = torch.zeros(2, 44100, device="cuda:0")  # 1 second of silence
+        dummy_audio = torch.zeros(2, 44100, device=f"cuda:{gpu_id}")  # 1 second of silence
         self.separator.separate_tensor(dummy_audio)
-        logging.info(f"Model weights loaded successfully in {time.time() - start_time:.2f} seconds")
+        logging.info(f"[GPU {gpu_id}] Model weights loaded successfully in {time.time() - start_time:.2f} seconds")
     
     def process_file(self, input_file, base_input_dir=None):
         """Process a single file while preserving directory structure"""
@@ -110,17 +114,17 @@ class VocalSeparator:
             total_time = time.time() - total_start
             
             # Log timing information
-            logging.info(f"\nProcessing times for {input_path.name}:")
-            logging.info(f"  Loading and separation: {load_time:.2f}s")
-            logging.info(f"  Post-processing: {post_time:.2f}s")
-            logging.info(f"  Saving: {save_time:.2f}s")
-            logging.info(f"  Cleanup: {cleanup_time:.2f}s")
-            logging.info(f"  Total time: {total_time:.2f}s")
+            logging.info(f"\n[GPU {self.gpu_id}] Processing times for {input_path.name}:")
+            logging.info(f"[GPU {self.gpu_id}]   Loading and separation: {load_time:.2f}s")
+            logging.info(f"[GPU {self.gpu_id}]   Post-processing: {post_time:.2f}s")
+            logging.info(f"[GPU {self.gpu_id}]   Saving: {save_time:.2f}s")
+            logging.info(f"[GPU {self.gpu_id}]   Cleanup: {cleanup_time:.2f}s")
+            logging.info(f"[GPU {self.gpu_id}]   Total time: {total_time:.2f}s")
             
             return str(output_path)
             
         except Exception as e:
-            logging.error(f"Error processing {input_file}: {str(e)}")
+            logging.error(f"[GPU {self.gpu_id}] Error processing {input_file}: {str(e)}")
             return None
 
     def process_files(self, input_files, base_input_dir=None):
@@ -128,7 +132,7 @@ class VocalSeparator:
         processed_files = []
         failed_files = []
         
-        with tqdm(total=len(input_files), desc="Processing files") as pbar:
+        with tqdm(total=len(input_files), desc=f"[GPU {self.gpu_id}] Processing files") as pbar:
             for input_file in input_files:
                 try:
                     result = self.process_file(input_file, base_input_dir)
@@ -137,7 +141,7 @@ class VocalSeparator:
                     else:
                         failed_files.append(str(input_file))
                 except Exception as e:
-                    logging.error(f"Error processing {input_file}: {str(e)}")
+                    logging.error(f"[GPU {self.gpu_id}] Error processing {input_file}: {str(e)}")
                     failed_files.append(str(input_file))
                 finally:
                     pbar.update(1)
@@ -145,11 +149,28 @@ class VocalSeparator:
                     torch.cuda.empty_cache()
         
         if failed_files:
-            with open(self.output_dir / "failed_files.txt", 'w') as f:
+            failed_file_path = self.output_dir / f"failed_files_gpu{self.gpu_id}.txt"
+            with open(failed_file_path, 'w') as f:
                 for file in failed_files:
                     f.write(f"{file}\n")
         
         return processed_files, failed_files
+
+def process_gpu_batch(gpu_id, files, output_dir, model_name, segment, bitrate, base_input_dir):
+    """Function to run in each process"""
+    separator = VocalSeparator(
+        output_dir=output_dir,
+        model_name=model_name,
+        segment=segment,
+        bitrate=bitrate,
+        gpu_id=gpu_id
+    )
+    return separator.process_files(files, base_input_dir)
+
+def split_list(lst, n):
+    """Split a list into n roughly equal parts"""
+    k, m = divmod(len(lst), n)
+    return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
 
 def main():
     import argparse
@@ -187,21 +208,48 @@ def main():
     
     logging.info(f"Found {len(input_files)} files to process")
     
-    # Initialize separator and process files
-    separator = VocalSeparator(
-        output_dir=args.output,
-        model_name=args.model,
-        segment=args.segment,
-        bitrate=args.bitrate
-    )
+    # Split files into NUM_GPUS groups
+    file_groups = split_list(input_files, NUM_GPUS)
     
-    processed_files, failed_files = separator.process_files(input_files, base_input_dir)
+    # Create processes for each GPU
+    processes = []
+    for gpu_id in range(NUM_GPUS):
+        p = mp.Process(
+            target=process_gpu_batch,
+            args=(
+                gpu_id,
+                file_groups[gpu_id],
+                args.output,
+                args.model,
+                args.segment,
+                args.bitrate,
+                base_input_dir
+            )
+        )
+        processes.append(p)
+        p.start()
     
-    logging.info(f"\nProcessing complete:")
-    logging.info(f"Successfully processed: {len(processed_files)} files")
-    if failed_files:
-        logging.warning(f"Failed to process: {len(failed_files)} files")
+    # Wait for all processes to complete
+    for p in processes:
+        p.join()
+    
+    logging.info("\nAll processes completed")
+    
+    # Combine failed files from all GPUs
+    all_failed_files = []
+    for gpu_id in range(NUM_GPUS):
+        failed_file_path = Path(args.output) / f"failed_files_gpu{gpu_id}.txt"
+        if failed_file_path.exists():
+            with open(failed_file_path) as f:
+                all_failed_files.extend(f.readlines())
+    
+    if all_failed_files:
+        with open(Path(args.output) / "failed_files.txt", 'w') as f:
+            f.writelines(all_failed_files)
+        logging.warning(f"Failed to process {len(all_failed_files)} files")
         logging.info("Failed files have been saved to failed_files.txt")
 
 if __name__ == "__main__":
+    # Required for Windows support
+    mp.freeze_support()
     main() 
