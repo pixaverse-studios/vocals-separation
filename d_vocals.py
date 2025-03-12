@@ -29,6 +29,7 @@ OUTPUT_SAMPLE_RATE = 16000  # 16kHz output
 OUTPUT_CHANNELS = 1  # mono output
 DEFAULT_SEGMENT = 7  # Demucs v4 supports up to 7.8s segments
 NUM_GPUS = 3  # Number of GPUs to use
+BATCH_SIZE = 4  # Number of files to process at once
 
 class VocalSeparator:
     def __init__(self, output_dir="vocal_output", model_name="htdemucs", segment=DEFAULT_SEGMENT, bitrate=128, gpu_id=0):
@@ -50,63 +51,102 @@ class VocalSeparator:
         self.separator.separate_tensor(dummy_audio)
         logging.info(f"[GPU {gpu_id}] Model ready")
     
-    def process_file(self, input_file, base_input_dir=None):
-        """Process a single file while preserving directory structure"""
+    def process_batch(self, batch_files, base_input_dir=None):
+        """Process a batch of files together"""
         try:
-            # Generate output path preserving directory structure
-            input_path = Path(input_file)
-            if base_input_dir:
-                # Get the relative path from base_input_dir
-                rel_path = input_path.relative_to(base_input_dir)
-                # Create output path with preserved structure
-                output_path = self.output_dir / rel_path.parent / f"{rel_path.stem}_vocals.mp3"
-            else:
-                # If no base_input_dir, just use the filename
-                output_path = self.output_dir / f"{input_path.stem}_vocals.mp3"
+            # Load all audio files in batch
+            audios = []
+            output_paths = []
+            valid_files = []
+            max_length = 0
             
-            # Create parent directories if they don't exist
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # First pass: load audio and find max length
+            for input_file in batch_files:
+                try:
+                    # Generate output path
+                    input_path = Path(input_file)
+                    if base_input_dir:
+                        rel_path = input_path.relative_to(base_input_dir)
+                        output_path = self.output_dir / rel_path.parent / f"{rel_path.stem}_vocals.mp3"
+                    else:
+                        output_path = self.output_dir / f"{input_path.stem}_vocals.mp3"
+                    
+                    # Skip if output exists
+                    if output_path.exists():
+                        continue
+                        
+                    # Create parent directories
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # Load audio
+                    audio, sr = torchaudio.load(str(input_file))
+                    max_length = max(max_length, audio.shape[-1])
+                    
+                    # Keep track of valid files
+                    audios.append(audio)
+                    output_paths.append(output_path)
+                    valid_files.append(input_file)
+                    
+                except Exception as e:
+                    logging.error(f"[GPU {self.gpu_id}] Error loading {input_file}: {str(e)}")
+                    continue
             
-            # Skip if output already exists
-            if output_path.exists():
-                return None
-
-            # Separate vocals
-            _, separated = self.separator.separate_audio_file(str(input_file))
+            if not valid_files:
+                return [], valid_files
             
-            # Extract vocals and convert to mono 16kHz
-            vocals = separated['vocals']
-            if vocals.shape[0] > 1:  # If stereo, convert to mono
-                vocals = vocals.mean(dim=0, keepdim=True)
+            # Second pass: pad audios to same length
+            padded_audios = []
+            for audio in audios:
+                if audio.shape[-1] < max_length:
+                    padding = max_length - audio.shape[-1]
+                    audio = torch.nn.functional.pad(audio, (0, padding))
+                padded_audios.append(audio)
             
-            # Resample if needed
-            if self.separator.samplerate != OUTPUT_SAMPLE_RATE:
-                resampler = torchaudio.transforms.Resample(
-                    self.separator.samplerate, 
-                    OUTPUT_SAMPLE_RATE
-                ).to(vocals.device)
-                vocals = resampler(vocals)
+            # Stack into batch and process
+            audio_batch = torch.stack(padded_audios).to(f"cuda:{self.gpu_id}")
+            separated_batch = self.separator.separate_tensor(audio_batch)
             
-            # Save as MP3
-            demucs.api.save_audio(
-                vocals,
-                str(output_path),
-                samplerate=OUTPUT_SAMPLE_RATE,
-                bitrate=self.bitrate
-            )
+            # Process and save each result
+            processed_files = []
+            for i, (vocals, output_path) in enumerate(zip(separated_batch['vocals'], output_paths)):
+                try:
+                    # Convert to mono if stereo
+                    if vocals.shape[0] > 1:
+                        vocals = vocals.mean(dim=0, keepdim=True)
+                    
+                    # Resample if needed
+                    if self.separator.samplerate != OUTPUT_SAMPLE_RATE:
+                        resampler = torchaudio.transforms.Resample(
+                            self.separator.samplerate, 
+                            OUTPUT_SAMPLE_RATE
+                        ).to(vocals.device)
+                        vocals = resampler(vocals)
+                    
+                    # Save as MP3
+                    demucs.api.save_audio(
+                        vocals,
+                        str(output_path),
+                        samplerate=OUTPUT_SAMPLE_RATE,
+                        bitrate=self.bitrate
+                    )
+                    processed_files.append(str(output_path))
+                    
+                except Exception as e:
+                    logging.error(f"[GPU {self.gpu_id}] Error saving {output_path}: {str(e)}")
+                    continue
             
             # Clear memory
-            del vocals, separated
+            del audio_batch, separated_batch, padded_audios, audios
             torch.cuda.empty_cache()
             
-            return str(output_path)
+            return processed_files, valid_files
             
         except Exception as e:
-            logging.error(f"[GPU {self.gpu_id}] Error processing {input_file}: {str(e)}")
-            return None
+            logging.error(f"[GPU {self.gpu_id}] Batch processing error: {str(e)}")
+            return [], batch_files
 
     def process_files(self, input_files, base_input_dir=None):
-        """Process all files sequentially"""
+        """Process files in batches"""
         processed_files = []
         failed_files = []
         
@@ -116,23 +156,18 @@ class VocalSeparator:
         total_estimated_time = timedelta(seconds=files_per_gpu * estimated_time_per_file)
         estimated_completion = datetime.now() + total_estimated_time
         
-        logging.info(f"[GPU {self.gpu_id}] Processing {len(input_files)} files. Estimated completion: {estimated_completion.strftime('%H:%M:%S')}")
+        logging.info(f"[GPU {self.gpu_id}] Processing {len(input_files)} files in batches of {BATCH_SIZE}. Estimated completion: {estimated_completion.strftime('%H:%M:%S')}")
         
         with tqdm(total=len(input_files), desc=f"[GPU {self.gpu_id}]") as pbar:
-            for input_file in input_files:
-                try:
-                    result = self.process_file(input_file, base_input_dir)
-                    if result:
-                        processed_files.append(result)
-                    else:
-                        failed_files.append(str(input_file))
-                except Exception as e:
-                    logging.error(f"[GPU {self.gpu_id}] Error processing {input_file}: {str(e)}")
-                    failed_files.append(str(input_file))
-                finally:
-                    pbar.update(1)
-                    gc.collect()
-                    torch.cuda.empty_cache()
+            # Process files in batches
+            for i in range(0, len(input_files), BATCH_SIZE):
+                batch_files = input_files[i:i + BATCH_SIZE]
+                batch_processed, batch_attempted = self.process_batch(batch_files, base_input_dir)
+                
+                # Update progress and track results
+                processed_files.extend(batch_processed)
+                failed_files.extend([f for f in batch_attempted if f not in batch_processed])
+                pbar.update(len(batch_attempted))
         
         if failed_files:
             failed_file_path = self.output_dir / f"failed_files_gpu{self.gpu_id}.txt"
